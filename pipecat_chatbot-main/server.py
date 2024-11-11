@@ -15,20 +15,36 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
+from typing import Literal
 
 from pipecat.transports.services.helpers.daily_rest import DailyRESTHelper, DailyRoomParams
 
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+# ------------ Configuration ------------ #
+
+MAX_SESSION_TIME = 5 * 60  # 5 minutes
+REQUIRED_ENV_VARS = [
+    "DAILY_API_KEY",
+    "OPENAI_API_KEY",
+    "ELEVENLABS_API_KEY",
+    "ELEVENLABS_VOICE_ID",
+    "FLY_API_KEY",
+    "FLY_APP_NAME",
+]
+
+FLY_API_HOST = os.getenv("FLY_API_HOST", "https://api.machines.dev/v1")
+FLY_APP_NAME = os.getenv("FLY_APP_NAME", "pipecat-fly-example")
+FLY_API_KEY = os.getenv("FLY_API_KEY", "")
+FLY_HEADERS = {"Authorization": f"Bearer {FLY_API_KEY}", "Content-Type": "application/json"}
+
+daily_helpers = {}
 
 MAX_BOTS_PER_ROOM = 1
 
 # Bot sub-process dict for status reporting and concurrency control
 bot_procs = {}
-
-daily_helpers = {}
-
 
 def cleanup():
     # Clean up function, just to be extra safe
@@ -69,6 +85,70 @@ class botConfig(BaseModel):
     emotion:str
     voiceSpeed: int
     prompt: str #Not better
+    emotionDict : list[dict]
+
+    [{"positivity":"high"},{"curiosity":None}, {}]
+
+
+def emotionTagConverter(emotionsDict):
+    emotions=[]
+    for i in emotionsDict:
+        tags= i.key() + ':'+ i.value()
+        emotions.append(tags)
+
+    return emotions
+
+
+# ----------------- Main ----------------- #
+
+
+async def spawn_fly_machine(room_url: str, token: str):
+    async with aiohttp.ClientSession() as session:
+        # Use the same image as the bot runner
+        async with session.get(
+            f"{FLY_API_HOST}/apps/{FLY_APP_NAME}/machines", headers=FLY_HEADERS
+        ) as r:
+            if r.status != 200:
+                text = await r.text()
+                raise Exception(f"Unable to get machine info from Fly: {text}")
+
+            data = await r.json()
+            image = data[0]["config"]["image"]
+
+        # Machine configuration
+        cmd = f"python3 bot.py -u {room_url} -t {token}"
+        cmd = cmd.split()
+        worker_props = {
+            "config": {
+                "image": image,
+                "auto_destroy": True,
+                "init": {"cmd": cmd},
+                "restart": {"policy": "no"},
+                "guest": {"cpu_kind": "shared", "cpus": 1, "memory_mb": 1024},
+            },
+        }
+
+        # Spawn a new machine instance
+        async with session.post(
+            f"{FLY_API_HOST}/apps/{FLY_APP_NAME}/machines", headers=FLY_HEADERS, json=worker_props
+        ) as r:
+            if r.status != 200:
+                text = await r.text()
+                raise Exception(f"Problem starting a bot worker: {text}")
+
+            data = await r.json()
+            # Wait for the machine to enter the started state
+            vm_id = data["id"]
+
+        async with session.get(
+            f"{FLY_API_HOST}/apps/{FLY_APP_NAME}/machines/{vm_id}/wait?state=started",
+            headers=FLY_HEADERS,
+        ) as r:
+            if r.status != 200:
+                text = await r.text()
+                raise Exception(f"Bot was unable to enter started state: {text}")
+
+    print(f"Machine joined room: {room_url}")
 
 
 
@@ -105,6 +185,7 @@ async def start_agent(request: botConfig) -> JSONResponse:
     if not token:
         raise HTTPException(status_code=500, detail=f"Failed to get token for room: {room.url}")
 
+    
     # Spawn a new agent, and join the user session
     # Note: this is mostly for demonstration purposes (refer to 'deployment' in README)
     try:
